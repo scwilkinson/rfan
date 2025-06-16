@@ -1,202 +1,303 @@
-// ---- Libraries ----
 #include <WiFi.h>
-#include <AsyncTCP.h>
-#include <AsyncMqttClient.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
 #include "RFM69Dreo.h"
-#include <esp_wifi.h>
 
-// ---- RFM69 Pin Configuration ----
+// WiFi credentials
+const char* ssid = "SC - Home";
+const char* password = "28848882";
+
+// MQTT Broker settings (Home Assistant)
+const char* mqtt_server = "homeassistant.local";
+const int mqtt_port = 1883;
+const char* mqtt_user = "sam";
+const char* mqtt_password = "CometComet1";
+
+// Device details
+const char* device_name = "Dreo Ceiling Fan Light";
+const char* device_id = "espdreo_led_001";
+
+// MQTT Topics for Home Assistant
+char mqtt_topic_command[128];
+char mqtt_topic_state[128];
+char mqtt_topic_availability[128];
+char mqtt_topic_config[128];
+char mqtt_topic_brightness_command[128];  // Add brightness topic
+char mqtt_topic_brightness_state[128];    // Add brightness state topic
+
+// Configure pins for ESP32-C6
 RFM69Dreo::PinConfig rfmPins = {
-  .cs   = 7,   // SPI Chip Select
-  .rst  = 6,   // Reset
-  .dio2 = 0,   // Data I/O
-  .irq  = 5    // Interrupt Request
+    .cs = D5,
+    .rst = D4,
+    .dio2 = D2,
+    .irq = D1
 };
 RFM69Dreo dreo(rfmPins);
 
-// ---- WiFi Configuration ----
-const char* WIFI_SSID     = "SC - Home";
-const char* WIFI_PASSWORD = "28848882";
+// WiFi and MQTT clients
+WiFiClient espClient;
+PubSubClient client(espClient);
 
-// ---- MQTT Configuration ----
-const char* MQTT_SERVER   = "10.27.27.220";  // IP to avoid mDNS issues
-const uint16_t MQTT_PORT  = 1883;
-const char* MQTT_USER     = "sam";
-const char* MQTT_PASS     = "CometComet1";
+// Light state
+bool ledState = false;
+int currentBrightness = 153;  // Track brightness (0-255, default 60% for 5 steps)
+const int BRIGHTNESS_STEPS = 5;  // Dreo light has 5 brightness levels
+const int BRIGHTNESS_STEP_SIZE = 255 / BRIGHTNESS_STEPS;  // 51 per step
+const int BRIGHTNESS_LEVELS[5] = {51, 102, 153, 204, 255};
 
-// ---- MQTT Topics ----
-const char* CMD_TOPIC           = "home/ceilingfan/light/set";
-const char* STATE_TOPIC         = "home/ceilingfan/light/state";
-const char* AVAILABILITY_TOPIC  = "home/ceilingfan/light/availability";
-const char* DISCOVERY_TOPIC     = "homeassistant/light/ceilingfan/config";
-
-// Home Assistant Discovery Payload
-const char* DISCOVERY_PAYLOAD = R"({
-  "name": "Ceiling Fan Light",
-  "unique_id": "esp32_ceilingfan_light",
-  "state_topic": "home/ceilingfan/light/state",
-  "command_topic": "home/ceilingfan/light/set",
-  "availability_topic": "home/ceilingfan/light/availability",
-  "payload_available": "online",
-  "payload_not_available": "offline",
-  "qos": 1,
-  "payload_on": "ON",
-  "payload_off": "OFF",
-  "retain": true
-})";
-
-// ---- Global Variables ----
-AsyncMqttClient mqttClient;
-bool lightOn = false; // Optimistic state
-
-// ---- Function Prototypes ----
-void initializeSerial();
-void initializeLed();
-void initializeRFM69();
-void initializeWiFi();
-void initializeMQTT();
-void connectToMqtt();
-void onWifiGotIP(arduino_event_id_t event, arduino_event_info_t info);
-void onMqttConnect(bool sessionPresent);
-void onMqttDisconnect(AsyncMqttClientDisconnectReason reason);
-void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties props, size_t len, size_t index, size_t total);
-void processLightToggleCommand();
-
-// ---- Setup Function ----
 void setup() {
-  initializeSerial();
-  initializeLed();
-  initializeRFM69();
-  initializeWiFi();
-  initializeMQTT();
-}
-
-// ---- Main Loop ----
-void loop() {
-  // AsyncMqttClient handles operations in the background.
-}
-
-// ---- Initialization Functions ----
-void initializeSerial() {
   Serial.begin(115200);
-  Serial.println("\nBooting Ceiling Fan Light Controller...");
-}
 
-void initializeLed() {
+  // Initialize LED
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
-}
 
-void initializeRFM69() {
-  Serial.println("Initializing RFM69...");
-  if (!dreo.begin()) {
-    Serial.println("RFM69 init failed! Halting.");
-    while (true) { // Blink LED for critical failure
-      digitalWrite(LED_BUILTIN, HIGH); delay(100);
-      digitalWrite(LED_BUILTIN, LOW);  delay(100);
-    }
-  }
-  Serial.println("RFM69 ready.");
-}
+  // Generate MQTT topics
+  sprintf(mqtt_topic_command, "homeassistant/light/%s/set", device_id);
+  sprintf(mqtt_topic_state, "homeassistant/light/%s/state", device_id);
+  sprintf(mqtt_topic_availability, "homeassistant/light/%s/availability", device_id);
+  sprintf(mqtt_topic_config, "homeassistant/light/%s/config", device_id);
+  sprintf(mqtt_topic_brightness_command, "homeassistant/light/%s/brightness/set", device_id);
+  sprintf(mqtt_topic_brightness_state, "homeassistant/light/%s/brightness", device_id);
 
-void initializeWiFi() {
-  Serial.printf("Connecting to WiFi: %s...\n", WIFI_SSID);
-  WiFi.onEvent(onWifiGotIP, ARDUINO_EVENT_WIFI_STA_GOT_IP);
-  WiFi.setAutoReconnect(true);
-  WiFi.persistent(true);
-  esp_wifi_set_ps(WIFI_PS_NONE); // Disable WiFi power-saving for MQTT stability
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-}
+  // Connect to WiFi
+  setup_wifi();
 
-void initializeMQTT() {
-  mqttClient.onConnect(onMqttConnect);
-  mqttClient.onDisconnect(onMqttDisconnect);
-  mqttClient.onMessage(onMqttMessage);
-  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
-  mqttClient.setCredentials(MQTT_USER, MQTT_PASS);
-  mqttClient.setWill(AVAILABILITY_TOPIC, 1, true, "offline"); // LWT
-  mqttClient.setKeepAlive(60);
-}
+  // Configure MQTT
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(mqtt_callback);
+  client.setBufferSize(1024);  // Increase buffer for JSON messages
+  reconnect();
 
-// ---- WiFi Event Callback ----
-void onWifiGotIP(arduino_event_id_t event, arduino_event_info_t info) {
-  Serial.printf("WiFi connected. IP: %s\n", WiFi.localIP().toString().c_str());
-  Serial.println("Connecting to MQTT...");
-  connectToMqtt();
-}
-
-// ---- MQTT Connection Logic ----
-void connectToMqtt() {
-  if (WiFi.isConnected()) {
-    mqttClient.connect();
-  }
-}
-
-// ---- MQTT Event Callbacks ----
-void onMqttConnect(bool sessionPresent) {
-  Serial.println("▶ MQTT connected.");
-
-  mqttClient.publish(AVAILABILITY_TOPIC, 1, true, "online");
-  Serial.printf("Published availability to: %s\n", AVAILABILITY_TOPIC);
-
-  mqttClient.publish(DISCOVERY_TOPIC, 1, true, DISCOVERY_PAYLOAD);
-  Serial.printf("Published HA discovery to: %s\n", DISCOVERY_TOPIC);
-
-  mqttClient.subscribe(CMD_TOPIC, 1);
-  Serial.printf("Subscribed to command topic: %s\n", CMD_TOPIC);
-
-  const char* currentLightState = lightOn ? "ON" : "OFF";
-  mqttClient.publish(STATE_TOPIC, 1, true, currentLightState);
-  Serial.printf("Published initial state '%s' to: %s\n", currentLightState, STATE_TOPIC);
-}
-
-void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
-  Serial.print("⚠ MQTT disconnected. Reason ID: ");
-  Serial.println((int8_t)reason); // Log reason code for debugging
-  Serial.println("Retrying MQTT connection in 5s...");
-  delay(5000);
-  if (WiFi.isConnected()) {
-    connectToMqtt();
+  // Initialize the RFM69 radio
+  Serial.println(F("Initializing RFM69..."));
+  if (dreo.begin()) {
+      Serial.println(F("RFM69HCW initialized successfully"));
   } else {
-    Serial.println("WiFi not connected. MQTT retry deferred.");
+      Serial.println(F("RFM69HCW initialization failed!"));
+      while(1);
   }
 }
 
-void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties props,
-                   size_t len, size_t index, size_t total) {
-  String msg;
-  msg.reserve(len + 1);
-  for (size_t i = 0; i < len; i++) {
-    msg += (char)payload[i];
+void setup_wifi() {
+  delay(10);
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
   }
-  msg.trim();
 
-  Serial.printf("📥 MQTT Rx: %s → %s\n", topic, msg.c_str());
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+}
 
-  if (String(topic).equals(CMD_TOPIC)) {
-    if (msg.equalsIgnoreCase("ON") ||
-        msg.equalsIgnoreCase("OFF") ||
-        msg.equalsIgnoreCase("TOGGLE")) {
-      processLightToggleCommand();
+void mqtt_callback(char* topic, byte* message, unsigned int length) {
+  Serial.print("Message arrived on topic: ");
+  Serial.print(topic);
+  Serial.print(". Message: ");
+
+  String messageTemp;
+  for (int i = 0; i < length; i++) {
+    messageTemp += (char)message[i];
+  }
+  Serial.println(messageTemp);
+
+  // Parse commands from Home Assistant
+  if (String(topic) == mqtt_topic_command) {
+    // Handle JSON commands from Home Assistant
+    StaticJsonDocument<256> doc;
+    DeserializationError error = deserializeJson(doc, messageTemp);
+
+    if (!error) {
+      // JSON command
+      if (doc.containsKey("state")) {
+        String state = doc["state"];
+        if (state == "ON") {
+          if (!ledState) {
+            ledState = true;
+            dreo.sendCommand(RFM69Dreo::LIGHT_ON_OFF);
+            digitalWrite(LED_BUILTIN, HIGH);
+          }
+        } else if (state == "OFF") {
+          if (ledState) {
+            ledState = false;
+            dreo.sendCommand(RFM69Dreo::LIGHT_ON_OFF);
+            digitalWrite(LED_BUILTIN, LOW);
+          }
+        }
+      }
+
+      if (doc.containsKey("brightness")) {
+        int targetBrightness = doc["brightness"];
+        adjustBrightness(targetBrightness);
+      }
     } else {
-      Serial.printf("Unknown command '%s' on topic %s.\n", msg.c_str(), topic);
+      // Simple string commands
+      if (messageTemp == "ON") {
+        if (!ledState) {
+          ledState = true;
+          dreo.sendCommand(RFM69Dreo::LIGHT_ON_OFF);
+          digitalWrite(LED_BUILTIN, HIGH);
+        }
+      }
+      else if (messageTemp == "OFF") {
+        if (ledState) {
+          ledState = false;
+          dreo.sendCommand(RFM69Dreo::LIGHT_ON_OFF);
+          digitalWrite(LED_BUILTIN, LOW);
+        }
+      }
+      else if (messageTemp == "BRIGHTNESS_UP") {
+        if (ledState) {
+          dreo.sendCommand(RFM69Dreo::LIGHT_UP);
+          currentBrightness = min(255, currentBrightness + BRIGHTNESS_STEP_SIZE);
+        }
+      }
+      else if (messageTemp == "BRIGHTNESS_DOWN") {
+        if (ledState) {
+          dreo.sendCommand(RFM69Dreo::LIGHT_DOWN);
+          currentBrightness = max(BRIGHTNESS_STEP_SIZE, currentBrightness - BRIGHTNESS_STEP_SIZE);
+        }
+      }
+    }
+
+    publishState();
+  }
+}
+
+void adjustBrightness(int targetBrightness) {
+  if (!ledState) return;
+
+  targetBrightness = constrain(targetBrightness, 51, 255);
+
+  // Find closest brightness level
+  int targetStep = 0;
+  int minDiff = 255;
+  for (int i = 0; i < BRIGHTNESS_STEPS; i++) {
+    int diff = abs(BRIGHTNESS_LEVELS[i] - targetBrightness);
+    if (diff < minDiff) {
+      minDiff = diff;
+      targetStep = i;
+    }
+  }
+
+  // Find current step
+  int currentStep = 0;
+  for (int i = 0; i < BRIGHTNESS_STEPS; i++) {
+    if (abs(BRIGHTNESS_LEVELS[i] - currentBrightness) < 5) {
+      currentStep = i;
+      break;
+    }
+  }
+
+  int stepsToMove = targetStep - currentStep;
+
+  Serial.print("Adjusting brightness from step ");
+  Serial.print(currentStep);
+  Serial.print(" (");
+  Serial.print(currentBrightness);
+  Serial.print(") to step ");
+  Serial.print(targetStep);
+  Serial.print(" (");
+  Serial.print(BRIGHTNESS_LEVELS[targetStep]);
+  Serial.println(")");
+
+  // Send UP or DOWN commands
+  if (stepsToMove > 0) {
+    for (int i = 0; i < stepsToMove; i++) {
+      dreo.sendCommand(RFM69Dreo::LIGHT_UP);
+      delay(150);  // Slightly longer delay for reliability
+    }
+  } else if (stepsToMove < 0) {
+    for (int i = 0; i < abs(stepsToMove); i++) {
+      dreo.sendCommand(RFM69Dreo::LIGHT_DOWN);
+      delay(150);
+    }
+  }
+
+  currentBrightness = BRIGHTNESS_LEVELS[targetStep];
+}
+
+void publishState() {
+  // Publish state as JSON for Home Assistant
+  StaticJsonDocument<256> doc;
+  doc["state"] = ledState ? "ON" : "OFF";
+  doc["brightness"] = currentBrightness;
+
+  char buffer[256];
+  serializeJson(doc, buffer);
+  client.publish(mqtt_topic_state, buffer, true);
+
+  Serial.print("Published state: ");
+  Serial.println(buffer);
+}
+
+void publishDiscoveryConfig() {
+  StaticJsonDocument<600> doc;
+
+  doc["name"] = device_name;
+  doc["unique_id"] = device_id;
+  doc["command_topic"] = mqtt_topic_command;
+  doc["state_topic"] = mqtt_topic_state;
+  doc["availability_topic"] = mqtt_topic_availability;
+  doc["brightness"] = true;  // Enable brightness support
+  doc["brightness_scale"] = 255;  // 0-255 scale
+  doc["schema"] = "json";  // Use JSON schema for commands
+  doc["payload_available"] = "online";
+  doc["payload_not_available"] = "offline";
+  doc["optimistic"] = false;
+
+  // Device information
+  JsonObject device = doc.createNestedObject("device");
+  device["identifiers"][0] = device_id;
+  device["name"] = "Dreo Controller";
+  device["model"] = "ESP32-C6 + RFM69";
+  device["manufacturer"] = "Custom";
+
+  char buffer[600];
+  serializeJson(doc, buffer);
+
+  Serial.println("Publishing discovery config:");
+  Serial.println(buffer);
+
+  if (client.publish(mqtt_topic_config, buffer, true)) {
+    Serial.println("Discovery published!");
+  } else {
+    Serial.println("Discovery publish failed!");
+  }
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+
+    if (client.connect(device_id, mqtt_user, mqtt_password, 
+                      mqtt_topic_availability, 0, true, "offline")) {
+      Serial.println("connected");
+
+      client.publish(mqtt_topic_availability, "online", true);
+      publishDiscoveryConfig();
+      client.subscribe(mqtt_topic_command);
+      publishState();
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      delay(5000);
     }
   }
 }
 
-// ---- Command Processing Function ----
-void processLightToggleCommand() {
-  Serial.println("Processing light toggle...");
-
-  dreo.sendCommand(RFM69Dreo::LIGHT_ON_OFF); // Assumes this is a toggle command
-  Serial.println("RF toggle command sent.");
-
-  digitalWrite(LED_BUILTIN, HIGH); delay(100);
-  digitalWrite(LED_BUILTIN, LOW);
-
-  lightOn = !lightOn;
-  const char* newState = lightOn ? "ON" : "OFF";
-
-  mqttClient.publish(STATE_TOPIC, 1, true, newState);
-  Serial.printf("📤 Published new state '%s' to: %s\n", newState, STATE_TOPIC);
+void loop() {
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
 }
