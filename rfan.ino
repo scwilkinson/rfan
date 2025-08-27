@@ -1,6 +1,7 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 #include "RFM69Dreo.h"
 
 // WiFi credentials
@@ -37,12 +38,27 @@ RFM69Dreo dreo(rfmPins);
 // WiFi and MQTT clients
 WiFiClient espClient;
 PubSubClient client(espClient);
+Preferences preferences;
 
-// Light state
-bool ledState = false;
-int currentBrightness = 153;  // Track brightness (0-255, default 60% for 5 steps)
-const int BRIGHTNESS_STEPS = 5;  // Dreo light has 5 brightness levels
-const int BRIGHTNESS_STEP_SIZE = 255 / BRIGHTNESS_STEPS;  // 51 per step
+// Connection management
+unsigned long lastMqttAttempt = 0;
+unsigned long lastWifiCheck = 0;
+const unsigned long RECONNECT_INTERVAL = 5000;
+const unsigned long WIFI_CHECK_INTERVAL = 10000;
+
+// Device state (persisted)
+struct DeviceState {
+  bool lightOn;
+  int brightness;
+};
+DeviceState currentState = {false, 153};
+
+// Command timing
+unsigned long lastCommandTime = 0;
+const unsigned long COMMAND_DEBOUNCE = 200;
+
+// Constants
+const int BRIGHTNESS_STEPS = 5;
 const int BRIGHTNESS_LEVELS[5] = {51, 102, 153, 204, 255};
 
 void setup() {
@@ -60,14 +76,20 @@ void setup() {
   sprintf(mqtt_topic_brightness_command, "homeassistant/light/%s/brightness/set", device_id);
   sprintf(mqtt_topic_brightness_state, "homeassistant/light/%s/brightness", device_id);
 
+  // Initialize preferences for state persistence
+  preferences.begin("dreo", false);
+  loadDeviceState();
+
   // Connect to WiFi
   setup_wifi();
 
   // Configure MQTT
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(mqtt_callback);
-  client.setBufferSize(1024);  // Increase buffer for JSON messages
-  reconnect();
+  client.setBufferSize(1024);
+  client.setKeepAlive(60);
+  
+  connectMqtt();
 
   // Initialize the RFM69 radio
   Serial.println(F("Initializing RFM69..."));
@@ -99,144 +121,109 @@ void setup_wifi() {
 }
 
 void mqtt_callback(char* topic, byte* message, unsigned int length) {
-  Serial.print("Message arrived on topic: ");
-  Serial.print(topic);
-  Serial.print(". Message: ");
+  // Debounce rapid commands
+  unsigned long now = millis();
+  if (now - lastCommandTime < COMMAND_DEBOUNCE) {
+    return;
+  }
+  lastCommandTime = now;
 
   String messageTemp;
   for (int i = 0; i < length; i++) {
     messageTemp += (char)message[i];
   }
-  Serial.println(messageTemp);
+  
+  Serial.printf("MQTT command: %s\n", messageTemp.c_str());
 
-  // Parse commands from Home Assistant
   if (String(topic) == mqtt_topic_command) {
-    // Handle JSON commands from Home Assistant
-    StaticJsonDocument<256> doc;
-    DeserializationError error = deserializeJson(doc, messageTemp);
-
-    if (!error) {
-      // JSON command
-      if (doc.containsKey("state")) {
-        String state = doc["state"];
-        if (state == "ON") {
-          if (!ledState) {
-            ledState = true;
-            dreo.sendCommand(RFM69Dreo::LIGHT_ON_OFF);
-            digitalWrite(LED_BUILTIN, HIGH);
-          }
-        } else if (state == "OFF") {
-          if (ledState) {
-            ledState = false;
-            dreo.sendCommand(RFM69Dreo::LIGHT_ON_OFF);
-            digitalWrite(LED_BUILTIN, LOW);
-          }
-        }
-      }
-
-      if (doc.containsKey("brightness")) {
-        int targetBrightness = doc["brightness"];
-        adjustBrightness(targetBrightness);
-      }
-    } else {
-      // Simple string commands
-      if (messageTemp == "ON") {
-        if (!ledState) {
-          ledState = true;
-          dreo.sendCommand(RFM69Dreo::LIGHT_ON_OFF);
-          digitalWrite(LED_BUILTIN, HIGH);
-        }
-      }
-      else if (messageTemp == "OFF") {
-        if (ledState) {
-          ledState = false;
-          dreo.sendCommand(RFM69Dreo::LIGHT_ON_OFF);
-          digitalWrite(LED_BUILTIN, LOW);
-        }
-      }
-      else if (messageTemp == "BRIGHTNESS_UP") {
-        if (ledState) {
-          dreo.sendCommand(RFM69Dreo::LIGHT_UP);
-          currentBrightness = min(255, currentBrightness + BRIGHTNESS_STEP_SIZE);
-        }
-      }
-      else if (messageTemp == "BRIGHTNESS_DOWN") {
-        if (ledState) {
-          dreo.sendCommand(RFM69Dreo::LIGHT_DOWN);
-          currentBrightness = max(BRIGHTNESS_STEP_SIZE, currentBrightness - BRIGHTNESS_STEP_SIZE);
-        }
-      }
-    }
-
-    publishState();
+    processCommand(messageTemp);
   }
 }
 
-void adjustBrightness(int targetBrightness) {
-  if (!ledState) return;
+void processCommand(String command) {
+  StaticJsonDocument<256> doc;
+  DeserializationError error = deserializeJson(doc, command);
+  
+  bool stateChanged = false;
+
+  if (!error) {
+    // Handle JSON commands from Home Assistant
+    if (doc.containsKey("state")) {
+      bool newState = (doc["state"] == "ON");
+      if (newState != currentState.lightOn) {
+        currentState.lightOn = newState;
+        sendRfCommand(RFM69Dreo::LIGHT_ON_OFF);
+        stateChanged = true;
+      }
+    }
+
+    if (doc.containsKey("brightness")) {
+      int targetBrightness = doc["brightness"];
+      if (adjustBrightness(targetBrightness)) {
+        stateChanged = true;
+      }
+    }
+  }
+
+  if (stateChanged) {
+    saveDeviceState();
+    publishState();
+    updateBuiltinLed();
+  }
+}
+
+bool adjustBrightness(int targetBrightness) {
+  if (!currentState.lightOn) return false;
 
   targetBrightness = constrain(targetBrightness, 51, 255);
-
+  
   // Find closest brightness level
-  int targetStep = 0;
-  int minDiff = 255;
-  for (int i = 0; i < BRIGHTNESS_STEPS; i++) {
-    int diff = abs(BRIGHTNESS_LEVELS[i] - targetBrightness);
-    if (diff < minDiff) {
-      minDiff = diff;
-      targetStep = i;
-    }
-  }
-
-  // Find current step
-  int currentStep = 0;
-  for (int i = 0; i < BRIGHTNESS_STEPS; i++) {
-    if (abs(BRIGHTNESS_LEVELS[i] - currentBrightness) < 5) {
-      currentStep = i;
-      break;
-    }
-  }
+  int targetStep = findClosestBrightnessStep(targetBrightness);
+  int currentStep = findClosestBrightnessStep(currentState.brightness);
+  
+  if (targetStep == currentStep) return false;
 
   int stepsToMove = targetStep - currentStep;
+  Serial.printf("Brightness: step %d->%d (%d->%d)\n", 
+                currentStep, targetStep, currentState.brightness, BRIGHTNESS_LEVELS[targetStep]);
 
-  Serial.print("Adjusting brightness from step ");
-  Serial.print(currentStep);
-  Serial.print(" (");
-  Serial.print(currentBrightness);
-  Serial.print(") to step ");
-  Serial.print(targetStep);
-  Serial.print(" (");
-  Serial.print(BRIGHTNESS_LEVELS[targetStep]);
-  Serial.println(")");
-
-  // Send UP or DOWN commands
-  if (stepsToMove > 0) {
-    for (int i = 0; i < stepsToMove; i++) {
-      dreo.sendCommand(RFM69Dreo::LIGHT_UP);
-      delay(150);  // Slightly longer delay for reliability
-    }
-  } else if (stepsToMove < 0) {
-    for (int i = 0; i < abs(stepsToMove); i++) {
-      dreo.sendCommand(RFM69Dreo::LIGHT_DOWN);
-      delay(150);
-    }
+  // Send brightness commands with proper timing
+  RFM69Dreo::Command cmd = (stepsToMove > 0) ? RFM69Dreo::LIGHT_UP : RFM69Dreo::LIGHT_DOWN;
+  for (int i = 0; i < abs(stepsToMove); i++) {
+    sendRfCommand(cmd);
+    if (i < abs(stepsToMove) - 1) delay(150);  // Delay between commands
   }
 
-  currentBrightness = BRIGHTNESS_LEVELS[targetStep];
+  currentState.brightness = BRIGHTNESS_LEVELS[targetStep];
+  return true;
+}
+
+int findClosestBrightnessStep(int brightness) {
+  int closestStep = 0;
+  int minDiff = 255;
+  for (int i = 0; i < BRIGHTNESS_STEPS; i++) {
+    int diff = abs(BRIGHTNESS_LEVELS[i] - brightness);
+    if (diff < minDiff) {
+      minDiff = diff;
+      closestStep = i;
+    }
+  }
+  return closestStep;
 }
 
 void publishState() {
-  // Publish state as JSON for Home Assistant
   StaticJsonDocument<256> doc;
-  doc["state"] = ledState ? "ON" : "OFF";
-  doc["brightness"] = currentBrightness;
+  doc["state"] = currentState.lightOn ? "ON" : "OFF";
+  doc["brightness"] = currentState.brightness;
 
   char buffer[256];
   serializeJson(doc, buffer);
-  client.publish(mqtt_topic_state, buffer, true);
-
-  Serial.print("Published state: ");
-  Serial.println(buffer);
+  
+  if (client.publish(mqtt_topic_state, buffer, true)) {
+    Serial.printf("State published: %s\n", buffer);
+  } else {
+    Serial.println("Failed to publish state");
+  }
 }
 
 void publishDiscoveryConfig() {
@@ -274,30 +261,91 @@ void publishDiscoveryConfig() {
   }
 }
 
-void reconnect() {
-  while (!client.connected()) {
-    Serial.print("Attempting MQTT connection...");
+// State persistence functions
+void loadDeviceState() {
+  currentState.lightOn = preferences.getBool("lightOn", false);
+  currentState.brightness = preferences.getInt("brightness", 153);
+  Serial.printf("Loaded state: light=%s, brightness=%d\n", 
+                currentState.lightOn ? "ON" : "OFF", currentState.brightness);
+  updateBuiltinLed();
+}
 
-    if (client.connect(device_id, mqtt_user, mqtt_password, 
-                      mqtt_topic_availability, 0, true, "offline")) {
-      Serial.println("connected");
+void saveDeviceState() {
+  preferences.putBool("lightOn", currentState.lightOn);
+  preferences.putInt("brightness", currentState.brightness);
+}
 
-      client.publish(mqtt_topic_availability, "online", true);
-      publishDiscoveryConfig();
-      client.subscribe(mqtt_topic_command);
-      publishState();
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      delay(5000);
-    }
+void updateBuiltinLed() {
+  digitalWrite(LED_BUILTIN, currentState.lightOn ? HIGH : LOW);
+}
+
+void sendRfCommand(RFM69Dreo::Command cmd) {
+  dreo.sendCommand(cmd);
+  Serial.printf("RF command sent: %d\n", cmd);
+}
+
+// Connection management
+bool connectMqtt() {
+  if (client.connected()) return true;
+  
+  unsigned long now = millis();
+  if (now - lastMqttAttempt < RECONNECT_INTERVAL) {
+    return false;
+  }
+  lastMqttAttempt = now;
+
+  Serial.print("Connecting to MQTT...");
+  
+  if (client.connect(device_id, mqtt_user, mqtt_password, 
+                     mqtt_topic_availability, 0, true, "offline")) {
+    Serial.println(" connected");
+    
+    // Publish online status
+    client.publish(mqtt_topic_availability, "online", true);
+    
+    // Setup device discovery
+    publishDiscoveryConfig();
+    
+    // Subscribe to commands
+    client.subscribe(mqtt_topic_command);
+    
+    // Publish current state (sync with HA after reconnect)
+    publishState();
+    
+    return true;
+  } else {
+    Serial.printf(" failed, rc=%d\n", client.state());
+    return false;
   }
 }
 
-void loop() {
-  if (!client.connected()) {
-    reconnect();
+bool checkWifi() {
+  if (WiFi.status() == WL_CONNECTED) return true;
+  
+  unsigned long now = millis();
+  if (now - lastWifiCheck < WIFI_CHECK_INTERVAL) {
+    return false;
   }
+  lastWifiCheck = now;
+
+  Serial.println("WiFi disconnected, reconnecting...");
+  WiFi.reconnect();
+  return false;
+}
+
+void loop() {
+  // Check WiFi connection
+  if (!checkWifi()) {
+    delay(1000);
+    return;
+  }
+  
+  // Maintain MQTT connection
+  if (!connectMqtt()) {
+    delay(100);
+    return;
+  }
+  
+  // Process MQTT messages
   client.loop();
 }
