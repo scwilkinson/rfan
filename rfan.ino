@@ -15,7 +15,7 @@ const char* mqtt_password = "CometComet1";
 
 // Device details
 const char* device_name = "Dreo Ceiling Fan Light";
-const char* device_id = "espdreo_led_001";
+const char* device_id = "esp_rf_dreo_001";
 
 // MQTT Topics for Home Assistant
 char mqtt_topic_command[128];
